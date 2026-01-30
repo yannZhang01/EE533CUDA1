@@ -1,28 +1,14 @@
 #include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
 #include <cuda_runtime.h>
 
-#define CHECK_CUDA(call)                                                     \
-    do {                                                                     \
-        cudaError_t err = call;                                              \
-        if (err != cudaSuccess) {                                            \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n",                     \
-                    __FILE__, __LINE__, cudaGetErrorString(err));            \
-            exit(EXIT_FAILURE);                                              \
-        }                                                                    \
-    } while (0)
-
-// Tile size (block dimension)
 #define BLOCK_SIZE 16
 
-// Tiled matrix multiplication kernel using shared memory
+/*************** 1. Tiled matrix multiplication ***************/
 __global__ void matrixMultiplyTiled(const float *A,
                                     const float *B,
                                     float *C,
                                     int N)
 {
-    // Shared memory for sub-tiles of A and B
     __shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
     __shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
 
@@ -37,7 +23,6 @@ __global__ void matrixMultiplyTiled(const float *A,
         int A_col = t * BLOCK_SIZE + threadIdx.x;
         int B_row = t * BLOCK_SIZE + threadIdx.y;
 
-        // Load data from global memory to shared memory
         if (row < N && A_col < N)
             As[threadIdx.y][threadIdx.x] = A[row * N + A_col];
         else
@@ -50,7 +35,6 @@ __global__ void matrixMultiplyTiled(const float *A,
 
         __syncthreads();
 
-        // Compute partial product for this tile
         for (int k = 0; k < BLOCK_SIZE; ++k) {
             sum += As[threadIdx.y][k] * Bs[k][threadIdx.x];
         }
@@ -63,88 +47,223 @@ __global__ void matrixMultiplyTiled(const float *A,
     }
 }
 
-// Initialize matrix with random values
-void initMatrix(float *M, int N)
+#ifdef _WIN32
+    #define DLL_EXPORT extern "C" __declspec(dllexport)
+#else
+    #define DLL_EXPORT extern "C"
+#endif
+
+DLL_EXPORT
+int gpu_matmul_tiled(const float *h_A,
+                     const float *h_B,
+                     float       *h_C,
+                     int          N)
 {
-    for (int i = 0; i < N * N; ++i) {
-        M[i] = (float)rand() / (float)RAND_MAX;
-    }
-}
-
-int main(int argc, char **argv)
-{
-    int N = 1024;
-    if (argc >= 2) {
-        N = atoi(argv[1]);
-        if (N <= 0) {
-            printf("Invalid matrix size.\n");
-            return 0;
-        }
-    }
-
-    printf("Tiled GPU Matrix Multiplication (shared memory), N = %d\n", N);
-
-    size_t size = (size_t)N * (size_t)N * sizeof(float);
-
-    // Host memory allocation
-    float *h_A = (float *)malloc(size);
-    float *h_B = (float *)malloc(size);
-    float *h_C = (float *)malloc(size);
-
-    if (!h_A || !h_B || !h_C) {
-        printf("Host memory allocation failed.\n");
+    if (N <= 0 || h_A == NULL || h_B == NULL || h_C == NULL) {
+        fprintf(stderr, "gpu_matmul_tiled: invalid arguments.\n");
         return -1;
     }
 
-    srand((unsigned int)time(NULL));
-    initMatrix(h_A, N);
-    initMatrix(h_B, N);
+    cudaError_t err = cudaSuccess;
+    size_t size = (size_t)N * (size_t)N * sizeof(float);
 
-    // Device memory allocation
     float *d_A = NULL;
     float *d_B = NULL;
     float *d_C = NULL;
 
-    CHECK_CUDA(cudaMalloc((void **)&d_A, size));
-    CHECK_CUDA(cudaMalloc((void **)&d_B, size));
-    CHECK_CUDA(cudaMalloc((void **)&d_C, size));
+    // Allocate device memory
+    err = cudaMalloc((void **)&d_A, size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc d_A failed: %s\n",
+                cudaGetErrorString(err));
+        goto cleanup;
+    }
 
-    CHECK_CUDA(cudaMemcpy(d_A, h_A, size, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_B, h_B, size, cudaMemcpyHostToDevice));
+    err = cudaMalloc((void **)&d_B, size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc d_B failed: %s\n",
+                cudaGetErrorString(err));
+        goto cleanup;
+    }
 
+    err = cudaMalloc((void **)&d_C, size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc d_C failed: %s\n",
+                cudaGetErrorString(err));
+        goto cleanup;
+    }
+
+    // Copy input matrices from host to device
+    err = cudaMemcpy(d_A, h_A, size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy h_A -> d_A failed: %s\n",
+                cudaGetErrorString(err));
+        goto cleanup;
+    }
+
+    err = cudaMemcpy(d_B, h_B, size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy h_B -> d_B failed: %s\n",
+                cudaGetErrorString(err));
+        goto cleanup;
+    }
+
+    // Configure grid and block
     dim3 block(BLOCK_SIZE, BLOCK_SIZE);
     dim3 grid((N + BLOCK_SIZE - 1) / BLOCK_SIZE,
               (N + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-    cudaEvent_t start, stop;
-    CHECK_CUDA(cudaEventCreate(&start));
-    CHECK_CUDA(cudaEventCreate(&stop));
-
-    // Warm-up kernel launch
+    // Launch kernel
     matrixMultiplyTiled<<<grid, block>>>(d_A, d_B, d_C, N);
-    CHECK_CUDA(cudaDeviceSynchronize());
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "matrixMultiplyTiled kernel failed: %s\n",
+                cudaGetErrorString(err));
+        goto cleanup;
+    }
 
-    CHECK_CUDA(cudaEventRecord(start, 0));
-    matrixMultiplyTiled<<<grid, block>>>(d_A, d_B, d_C, N);
-    CHECK_CUDA(cudaEventRecord(stop, 0));
-    CHECK_CUDA(cudaEventSynchronize(stop));
+    // Copy result back to host
+    err = cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy d_C -> h_C failed: %s\n",
+                cudaGetErrorString(err));
+        goto cleanup;
+    }
 
-    float elapsed_ms = 0.0f;
-    CHECK_CUDA(cudaEventElapsedTime(&elapsed_ms, start, stop));
+cleanup:
+    if (d_A) cudaFree(d_A);
+    if (d_B) cudaFree(d_B);
+    if (d_C) cudaFree(d_C);
 
-    CHECK_CUDA(cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost));
+    return (err == cudaSuccess) ? 0 : -1;
+}
 
-    printf("GPU execution time (tiled, N=%d): %.3f ms\n", N, elapsed_ms);
+/*************** 2. Basic single-channel 2D convolution ***************/
+__global__ void conv2dKernel(const float *input,
+                             const float *kernel,
+                             float *output,
+                             int H, int W,
+                             int K,
+                             int outH,
+                             int outW)
+{
+    int out_r = blockIdx.y * blockDim.y + threadIdx.y;
+    int out_c = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // Cleanup
-    CHECK_CUDA(cudaEventDestroy(start));
-    CHECK_CUDA(cudaEventDestroy(stop));
-    CHECK_CUDA(cudaFree(d_A));
-    CHECK_CUDA(cudaFree(d_B));
-    CHECK_CUDA(cudaFree(d_C));
-    free(h_A);
-    free(h_B);
-    free(h_C);
+    if (out_r >= outH || out_c >= outW)
+        return;
 
-    return 0;
+    float sum = 0.0f;
+
+    for (int kr = 0; kr < K; ++kr) {
+        for (int kc = 0; kc < K; ++kc) {
+            int in_r = out_r + kr;
+            int in_c = out_c + kc;
+            float v_in = input[in_r * W + in_c];
+            float v_k  = kernel[kr * K + kc];
+            sum += v_in * v_k;
+        }
+    }
+
+    output[out_r * outW + out_c] = sum;
+}
+
+DLL_EXPORT
+int gpu_conv2d(const float *h_input,
+               const float *h_kernel,
+               float       *h_output,
+               int          H,
+               int          W,
+               int          K)
+{
+    if (H <= 0 || W <= 0 || K <= 0 ||
+        h_input == NULL || h_kernel == NULL || h_output == NULL) {
+        fprintf(stderr, "gpu_conv2d: invalid arguments.\n");
+        return -1;
+    }
+
+    if (K > H || K > W) {
+        fprintf(stderr, "gpu_conv2d: kernel size larger than input.\n");
+        return -1;
+    }
+
+    cudaError_t err = cudaSuccess;
+
+    int outH = H - K + 1;
+    int outW = W - K + 1;
+
+    size_t in_size   = (size_t)H    * (size_t)W    * sizeof(float);
+    size_t ker_size  = (size_t)K    * (size_t)K    * sizeof(float);
+    size_t out_size  = (size_t)outH * (size_t)outW * sizeof(float);
+
+    float *d_input  = NULL;
+    float *d_kernel = NULL;
+    float *d_output = NULL;
+
+    // Allocate device memory
+    err = cudaMalloc((void **)&d_input, in_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc d_input failed: %s\n",
+                cudaGetErrorString(err));
+        goto cleanup;
+    }
+
+    err = cudaMalloc((void **)&d_kernel, ker_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc d_kernel failed: %s\n",
+                cudaGetErrorString(err));
+        goto cleanup;
+    }
+
+    err = cudaMalloc((void **)&d_output, out_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc d_output failed: %s\n",
+                cudaGetErrorString(err));
+        goto cleanup;
+    }
+
+    // Copy host data to device
+    err = cudaMemcpy(d_input, h_input, in_size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy h_input -> d_input failed: %s\n",
+                cudaGetErrorString(err));
+        goto cleanup;
+    }
+
+    err = cudaMemcpy(d_kernel, h_kernel, ker_size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy h_kernel -> d_kernel failed: %s\n",
+                cudaGetErrorString(err));
+        goto cleanup;
+    }
+
+    // Configure grid and block
+    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 grid((outW + BLOCK_SIZE - 1) / BLOCK_SIZE,
+              (outH + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+    // Launch kernel
+    conv2dKernel<<<grid, block>>>(d_input, d_kernel, d_output,
+                                  H, W, K, outH, outW);
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "conv2dKernel execution failed: %s\n",
+                cudaGetErrorString(err));
+        goto cleanup;
+    }
+
+    // Copy result back to host
+    err = cudaMemcpy(h_output, d_output, out_size, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy d_output -> h_output failed: %s\n",
+                cudaGetErrorString(err));
+        goto cleanup;
+    }
+
+cleanup:
+    if (d_input)  cudaFree(d_input);
+    if (d_kernel) cudaFree(d_kernel);
+    if (d_output) cudaFree(d_output);
+
+    return (err == cudaSuccess) ? 0 : -1;
 }
