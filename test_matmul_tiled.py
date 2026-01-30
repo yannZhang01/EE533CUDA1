@@ -16,6 +16,18 @@ gpu_matmul_tiled.argtypes = [
 ]
 gpu_matmul_tiled.restype = c_int
 
+def warmup():
+    Nw = 256
+    A = np.random.rand(Nw, Nw).astype(np.float32)
+    B = np.random.rand(Nw, Nw).astype(np.float32)
+    C = np.zeros((Nw, Nw), dtype=np.float32)
+    _ = gpu_matmul_tiled(
+        A.ctypes.data_as(POINTER(c_float)),
+        B.ctypes.data_as(POINTER(c_float)),
+        C.ctypes.data_as(POINTER(c_float)),
+        c_int(Nw)
+    )
+
 def run_test(N=512):
     print(f"\n=== Testing gpu_matmul_tiled with N = {N} ===")
 
@@ -53,6 +65,7 @@ def run_test(N=512):
     print(f"Max absolute error: {max_err:e}")
 
 if __name__ == "__main__":
+    warmup()
     # Test multiple sizes
     for N in [512, 1024, 2048]:
         run_test(N)
